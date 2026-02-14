@@ -239,13 +239,11 @@ BPlusTree::InsertResult BPlusTree::InsertInternal(page_id_t node_page_id, const 
         auto it = std::lower_bound(keys.begin(), keys.end(), key);
         size_t pos = it - keys.begin();
 
-        // Check for duplicate key — update in place
-        if (it != keys.end() && *it == key) {
-            rids[pos] = rid;
-            std::memset(page->GetData(), 0, 4096);
-            WriteLeafNode(page->GetData(), keys, rids, header.next_leaf);
-            bpm_->UnpinPage(node_page_id, true);
-            return {false, "", INVALID_PAGE_ID};
+        // Allow duplicate keys (non-unique indexes)
+        // Skip to after existing entries with the same key
+        while (it != keys.end() && *it == key) {
+            ++it;
+            ++pos;
         }
 
         keys.insert(it, key);

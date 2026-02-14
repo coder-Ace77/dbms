@@ -476,11 +476,12 @@ std::string Server::ProcessCommand(const std::string& request_json) {
         // ---- find ----
         if (cmd == "find") {
             std::vector<Predicate> predicates;
+            std::shared_ptr<BsonDocument> filter_doc_ptr;
             auto filter_it = req.elements.find("filter");
             if (filter_it != req.elements.end() &&
                 std::holds_alternative<std::shared_ptr<BsonDocument>>(filter_it->second)) {
-                auto& filter_doc = *std::get<std::shared_ptr<BsonDocument>>(filter_it->second);
-                for (auto& [k, v] : filter_doc.elements) {
+                filter_doc_ptr = std::get<std::shared_ptr<BsonDocument>>(filter_it->second);
+                for (auto& [k, v] : filter_doc_ptr->elements) {
                     Predicate p;
                     p.field_name = k;
                     p.op = CompareOp::EQ;
@@ -493,6 +494,7 @@ std::string Server::ProcessCommand(const std::string& request_json) {
             ss << R"({"ok":true,"result":[)";
 
             if (predicates.empty()) {
+                // No filter — full sequential scan
                 SeqScanExecutor scan(coll->heap_file.get());
                 scan.Init();
                 Tuple tuple;
@@ -504,17 +506,81 @@ std::string Server::ProcessCommand(const std::string& request_json) {
                 }
                 scan.Close();
             } else {
-                auto child = std::make_unique<SeqScanExecutor>(coll->heap_file.get());
-                FilterExecutor filter(std::move(child), predicates);
-                filter.Init();
+                // Check if any predicate field has an index
+                BPlusTree* matched_index = nullptr;
+                std::string index_key;
+                std::string index_field;
+                std::vector<Predicate> remaining_predicates;
+
+                for (auto& pred : predicates) {
+                    bool found_index = false;
+                    if (!matched_index) {
+                        for (auto& idx : coll->indexes) {
+                            if (idx.field_name == pred.field_name && pred.op == CompareOp::EQ) {
+                                matched_index = idx.btree.get();
+                                index_field = pred.field_name;
+                                // Convert value to string key for B+ Tree
+                                if (std::holds_alternative<std::string>(pred.value))
+                                    index_key = std::get<std::string>(pred.value);
+                                else if (std::holds_alternative<int32_t>(pred.value))
+                                    index_key = std::to_string(std::get<int32_t>(pred.value));
+                                else if (std::holds_alternative<int64_t>(pred.value))
+                                    index_key = std::to_string(std::get<int64_t>(pred.value));
+                                found_index = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!found_index) {
+                        remaining_predicates.push_back(pred);
+                    }
+                }
+
                 Tuple tuple;
                 bool first = true;
-                while (filter.Next(&tuple)) {
-                    if (!first) ss << ",";
-                    first = false;
-                    ss << DocToJSON(tuple.doc);
+
+                if (matched_index && !index_key.empty()) {
+                    // Use index scan (equality: lo_key == hi_key)
+                    IndexScanExecutor iscan(matched_index, coll->heap_file.get(),
+                                            index_key, index_key);
+                    iscan.Init();
+
+                    if (remaining_predicates.empty()) {
+                        while (iscan.Next(&tuple)) {
+                            if (!first) ss << ",";
+                            first = false;
+                            ss << DocToJSON(tuple.doc);
+                        }
+                    } else {
+                        // Index narrows results, then apply remaining filters
+                        while (iscan.Next(&tuple)) {
+                            bool match = true;
+                            for (auto& rp : remaining_predicates) {
+                                auto it = tuple.doc.elements.find(rp.field_name);
+                                if (it == tuple.doc.elements.end() || it->second != rp.value) {
+                                    match = false; break;
+                                }
+                            }
+                            if (match) {
+                                if (!first) ss << ",";
+                                first = false;
+                                ss << DocToJSON(tuple.doc);
+                            }
+                        }
+                    }
+                    iscan.Close();
+                } else {
+                    // Fallback: sequential scan + filter
+                    auto child = std::make_unique<SeqScanExecutor>(coll->heap_file.get());
+                    FilterExecutor filter(std::move(child), predicates);
+                    filter.Init();
+                    while (filter.Next(&tuple)) {
+                        if (!first) ss << ",";
+                        first = false;
+                        ss << DocToJSON(tuple.doc);
+                    }
+                    filter.Close();
                 }
-                filter.Close();
             }
 
             ss << "]}";
